@@ -13,12 +13,22 @@
 #include "dac_high.pio.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
+#include "dadadadum.h"
+#include "hardware/timer.h"
+#include "hardware/irq.h"
 
-#define SYS_CLK 300000000     // System clock frequency (300 MHz)
+#define TS_US 125
+#define SYS_CLK 300000000 // System clock frequency (300 MHz)
+static uint32_t sys_clk = SYS_CLK;
+#define PIO_CLK_DIV 1         // PIO clock divider
 #define WAVE_BUFFER_SIZE 4096 // Size of the waveform buffer
+static uint32_t save_dma_buffer[WAVE_BUFFER_SIZE];
 static uint32_t dma_buffer[WAVE_BUFFER_SIZE];
+static uint32_t buffer_size = WAVE_BUFFER_SIZE;
 
-#define MAX_TABLE_LEN 256         // Maximum length of the waveform lookup table
+static float frequency = 1.7e6;
+
+#define MAX_TABLE_LEN 16          // Maximum length of the waveform lookup table
 uint8_t wav_table[MAX_TABLE_LEN]; // Waveform lookup table
 
 uint32_t table_len = MAX_TABLE_LEN; // Actual length of the waveform lookup table
@@ -27,6 +37,8 @@ uint32_t table_len = MAX_TABLE_LEN; // Actual length of the waveform lookup tabl
 static PIO pio;
 static uint sm;
 static uint offset;
+
+static int index = 0; // Index for dadadadum_wav
 
 #define BASE_PIN 1 // first GPIO of your 8-bit R-2R DAC
 static pio_sm_config c;
@@ -53,7 +65,8 @@ void pio_init()
     // Configure shift: autopull, shift right, 32 bits at a time
     sm_config_set_out_shift(&c, true, true, 32);
 
-    sm_config_set_clkdiv(&c, 1);
+    // Clock divider run at SYS_CLK / PIO_CLK_DIV
+    sm_config_set_clkdiv(&c, (float)SYS_CLK / (float)sys_clk);
 
     // Initialize and enable state machine
     pio_sm_init(pio, sm, offset, &c);
@@ -64,7 +77,7 @@ void pio_init()
 // One of the issues is that DMA is word aligned, so the pattern has to repeat on WORD,
 // not byte boundaries.
 int fill_dma_buffer(uint32_t *buf, float freq, float fs,
-                    const uint8_t *table, int table_len)
+                    const uint8_t *table, int table_len, uint8_t amplitude)
 {
 
     int idx_bits = __builtin_ctz(table_len); // Get the number of bits needed to represent the table index
@@ -87,8 +100,7 @@ int fill_dma_buffer(uint32_t *buf, float freq, float fs,
             phase += phase_inc;
             index = phase >> (32 - idx_bits) & idx_mask;
 
-            packed |= table[index] << (j * 8);
-            printf("Index: %d, i: %d\n", index, 4 * i + j);
+            packed |= table[index] * amplitude / 255 << (j * 8);
         }
         if (first_index == -1)
         {
@@ -100,12 +112,53 @@ int fill_dma_buffer(uint32_t *buf, float freq, float fs,
     }
     // throw away the last word, it's a repeat
     i--;
-    printf("Generated %d words for DMA\n", i);
-    printf("Phase increment: %d\n", phase_inc);
-    printf("Index: %d\n", index);
-    printf("First index: %d\n", first_index);
 
     return i; // number of 32-bit words for DMA
+}
+// One LUT per amplitude setting would be 256×256 entries (~64 KB).
+// Too big. Instead, compute per amplitude when it changes.
+static uint8_t scale_lut[256];
+
+// Call whenever amplitude changes (costly only once per change).
+void build_scale_lut(uint8_t amplitude)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        scale_lut[i] = (uint8_t)((i * amplitude) / 255u);
+    }
+}
+
+void build_scale_lut2(uint8_t amplitude)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        int16_t centered = i - 128; // shift to signed range [-128,127]
+        int16_t scaled = (centered * amplitude) / 255;
+        int16_t result = scaled + 128;
+
+        // clamp to 0..255
+        if (result < 0)
+            result = 0;
+        else if (result > 255)
+            result = 255;
+
+        scale_lut[i] = (uint8_t)result;
+    }
+}
+void amplify_dma_buffer(const uint32_t *orig, uint32_t *buf, uint32_t size)
+{
+    for (uint32_t i = 0; i < size; i++)
+    {
+        uint32_t w = orig[i];
+        uint8_t s0 = scale_lut[(w >> 0) & 0xFF];
+        uint8_t s1 = scale_lut[(w >> 8) & 0xFF];
+        uint8_t s2 = scale_lut[(w >> 16) & 0xFF];
+        uint8_t s3 = scale_lut[(w >> 24) & 0xFF];
+        buf[i] = (uint32_t)s0 |
+                 ((uint32_t)s1 << 8) |
+                 ((uint32_t)s2 << 16) |
+                 ((uint32_t)s3 << 24);
+    }
 }
 
 void generate_sine_table(uint8_t *table, int table_len)
@@ -117,41 +170,6 @@ void generate_sine_table(uint8_t *table, int table_len)
         // scale sine from [-1, 1] to [0, 255]
         double s = (sin(theta) + 1.0) * 126.5;
         table[n] = (uint8_t)lrint(s); // round to nearest integer
-    }
-}
-
-void generate_triangle_table(uint8_t *table, int table_len)
-{
-    for (int i = 0; i < table_len; i++)
-    {
-        if (i < table_len / 2)
-        {
-            // Rising edge: 0 → 255
-            table[i] = (uint8_t)((i * 255) / (table_len / 2 - 1));
-        }
-        else
-        {
-            // Falling edge: 255 → 0
-            int j = i - table_len / 2;
-            table[i] = (uint8_t)(255 - (j * 255) / (table_len / 2 - 1));
-        }
-    }
-}
-
-void generate_square_table(uint8_t *table, int table_len)
-{
-    for (int i = 0; i < table_len; i++)
-    {
-        if (i < table_len / 2)
-        {
-            // Rising edge: 0 → 255
-            table[i] = 255;
-        }
-        else
-        {
-            // Falling edge: 255 → 0
-            table[i] = 0;
-        }
     }
 }
 
@@ -233,22 +251,49 @@ void initialize()
     sleep_ms(1000);
 }
 
+int count = 0;
+void __isr __time_critical_func(timer0_irq)()
+{
+    // Ack alarm 0
+    timer_hw->intr = 1u << 0;
+
+    uint8_t ampl = dadadadum_wav[index] / 2;
+
+    // Output next sample
+    build_scale_lut(ampl);                                        // build scale LUT for current amplitude
+    amplify_dma_buffer(save_dma_buffer, dma_buffer, buffer_size); // start_dma(dma_buffer, length);
+    index++;
+    count++;
+    if (index >= sizeof(dadadadum_wav) / sizeof(dadadadum_wav[0]))
+        index = 0;
+
+    // Next tick
+    timer_hw->alarm[0] = timer_hw->timerawl + TS_US;
+}
+
 int main()
 {
     initialize();
 
-    float frequency = 150e6;
     generate_sine_table(wav_table, table_len);
-    generate_triangle_table(wav_table, table_len);
-    //  generate_square_table(wav_table, table_len);
+
     pio_init();
-    int length = fill_dma_buffer(dma_buffer, frequency, SYS_CLK, wav_table, table_len);
-    start_dma(dma_buffer, length);
+    buffer_size = fill_dma_buffer(save_dma_buffer, frequency, sys_clk, wav_table, table_len, 255);
+    build_scale_lut(255); // build scale LUT for full amplitude
+    amplify_dma_buffer(save_dma_buffer, dma_buffer, buffer_size);
+    start_dma(dma_buffer, buffer_size);
+
+    timer_hw->alarm[0] = timer_hw->timerawl + TS_US;
+    irq_set_exclusive_handler(TIMER0_IRQ_0, timer0_irq);
+    irq_set_enabled(TIMER0_IRQ_0, true);
+    timer_hw->inte = 1u << 0;
 
     while (1)
     {
 
         tight_loop_contents();
+        sleep_ms(1000);
+        printf("Count: %d, Index: %d, Amplitude: %d\n", count, index, dadadadum_wav[index]);
     }
 
     return 0;

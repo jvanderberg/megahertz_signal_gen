@@ -41,6 +41,7 @@
         "pwm.h": "c",
         "adc.h": "c",
         "random": "c",
-        "dac_high.pio.h": "c"
+        "dac_high.pio.h": "c",
+        "dma.h": "c"
     }
 }
