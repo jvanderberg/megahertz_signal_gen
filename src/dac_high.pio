@@ -1,0 +1,11 @@
+.program dac_high
+; Simple 8-bit DAC streamer
+; Assumes DMA feeds TX FIFO with 8-bit samples.
+
+.wrap_target
+    out pins, 8    ; output 8 bits from OSR to DAC pins
+    out pins, 8    ; output 8 bits from OSR to DAC pins
+    out pins, 8    ; output 8 bits from OSR to DAC pins
+    out pins, 8    ; output 8 bits from OSR to DAC pins
+
+.wrap
